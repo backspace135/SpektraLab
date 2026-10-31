@@ -292,15 +292,36 @@ public:
             detail = "Vulkan probe passed (precise product + fused fma; full shader parity pending)";
             return true;
         }
-        if (zero && !exact && properties_.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
-            // The double-float kernels then take an exact Dekker product
-            // instead of fma (specialization constant 0; see two_prod in
-            // spk_iir_df_acc.comp): without it the IIR blur's low word is lost
-            // and the recursion amplifies it -- 0.4 % on a 257-px constant row.
+        // Unfused fma, on any device class the engine can still trust the
+        // double-float kernels on: take the exact Dekker two_prod instead
+        // (specialization constant 0; see two_prod in spk_iir_df_acc.comp).
+        // Without it the IIR blur's low word is lost and the recursion
+        // amplifies it -- 0.4 % on a 257-px constant row.
+        //
+        // Two device classes land here. A CPU device (Mesa lavapipe) lowers
+        // fma() to a multiply and an add even under `precise` (measured
+        // 2026-10-05, llvmpipe LLVM 20, Mesa 25.2). And Qualcomm Adreno does
+        // the same on a real GPU: measured 2026-10-31 on an Adreno 740
+        // (Snapdragon 8 Gen 2, driver 2150252545, api 1.3.128) the probe's
+        // residual is exactly 0 for every lane, i.e. fma is never fused.
+        // Neither is "fast math": both are a correct-but-unfused fma, one
+        // rounding per fma from a fused device and well inside the 3e-5 render
+        // bar. The Dekker path then recovers the double-float kernels exactly
+        // -- iir_df_acc max abs error 1.49011612e-08 and geometry_resample_df
+        // 4.99896339e-07 on Adreno, both bit-for-bit the lavapipe baseline. So
+        // the gate accepts any unfused device whose residuals are *all* exactly
+        // zero (a clean unfuse), and still refuses one that fuses some lanes
+        // and not others (mixed), or returns non-zero wrong residuals
+        // (genuinely fast/contracted math).
+        if (zero && !exact &&
+            (properties_.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU ||
+             properties_.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU)) {
             fused_fma_ = 0;
-            detail = "Vulkan probe passed on a CPU device with unfused fma (double-float kernels use an "
-                     "exact Dekker product; full shader parity pending)";
-            probe_cpu_storage_range(detail);
+            detail = std::string("Vulkan probe passed with unfused fma on a ") +
+                     (properties_.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU ? "CPU" : "integrated-GPU") +
+                     " device (double-float kernels use an exact Dekker product; full shader parity pending)";
+            if (properties_.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU)
+                probe_cpu_storage_range(detail);
             return true;
         }
         if (!exact && !zero) { detail = "Vulkan math probe produced no informative residuals"; return false; }
