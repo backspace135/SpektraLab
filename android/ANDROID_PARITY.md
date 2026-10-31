@@ -80,23 +80,46 @@ it, the double-float kernels land **bit-for-bit on the lavapipe baseline**:
 
 `spk_math_probe` itself now passes on-device (`math_mode_ok: true`).
 
-### (b) `pow` precision on the BT.709 breakpoint — **open, recorded**
+### (b) `pow` precision on the BT.709 breakpoint — **open, recorded, root-caused**
 
-`spk_vulkan_pointwise` / `spk_cctf_decode` mode 3 (BT.709 OETF) fails on one
-sample: the value at `nextafter(bt_breakpoint, 0)` — a hair below the linear/
-power join — renders **0.018** against the reference **0.0180551012**,
-delta **5.51e-05** against a tolerance of 1.13e-07. The cause is Adreno's
-`pow` precision near the `alpha·pow(beta,0.45) − (alpha−1)` breakpoint, which
-shifts which side of the discontinuity the sample lands on.
+`spk_vulkan_pointwise` / `spk_cctf_decode` mode 3 (BT.709 OETF) fails on the
+sample at the linear/power join: it renders **0.018** against the reference
+**0.0180551012**, delta **5.51e-05** against a tolerance of 1.13e-07.
 
-**This is Adreno-specific, not a shader bug**: the identical SPIR-V passes all
-130 pointwise cases on an NVIDIA RTX 4060 (desktop Vulkan, max err 3.5e-5
-within tolerance), and the whole suite is green on lavapipe. Recorded here as
-an accepted-pending-decision divergence. Candidate remedies for stage 1:
-evaluate `pow` as `exp2(log2(x)·e)` with a guarded `log2`, or compute the
-BT.709 breakpoint on the host and pass it in rather than deriving it in-shader.
-**Not** resolved by relaxing the tolerance — the breakpoint must stay exact or
-the encode/decode pair drifts (trap: colour bugs are silent).
+Root cause, established with an on-device diagnostic (a one-shot Vulkan runner
+and an engine-shaped kernel, since removed): the mode-3 breakpoint
+`alpha·pow(beta,0.45) − (alpha−1)` is computed by a **runtime `pow`** — glslang
+emits an `ExtInst Pow` rather than folding it (verified on 14.3) — so the
+breakpoint is exactly as precise as the *driver's* `pow`. Measured:
+
+| who | breakpoint |
+|---|---|
+| MSVC host (Windows test reference) | `0x3da66554` |
+| MinGW host (Android test reference) | `0x3da66555` |
+| Adreno 740 runtime pow | ≈`0x3da66554` region but shifted enough to mis-route the boundary sample |
+| colour.cpp double truth, narrowed | `0x3da66555` |
+
+The value differs by **one ULP between the two host C runtimes already**, and
+the Adreno `pow` adds its own error on top. Two consequences:
+
+1. **No single literal fixes it.** Hard-coding `0x3da66555` makes the Adreno
+   probe green but turns the desktop NVIDIA/MSVC probe red (its reference
+   expects `0x3da66554`), and vice-versa. The breakpoint is genuinely
+   non-portable as long as it is a per-runtime `pow`.
+2. The power branch itself is within ~1 ULP on Adreno (it returns
+   0.0180000048 for the true 0.0180000009) — so this is a *boundary-routing*
+   precision issue, not a wrong transfer curve.
+
+**Decision deferred to stage 1.** The correct fix is to stop deriving the
+breakpoint in-shader: compute it once on the host (double, matching
+colour.cpp) and pass it in via the meta buffer or a specialization constant, so
+shader and reference share one value. That is a small wire/ABI decision
+(`API-SPEC-callable-render-service.md`), not something to slip into a porting
+probe — which is why it is recorded here rather than patched. **Not** resolved
+by widening the tolerance: the breakpoint must stay exact or the encode/decode
+pair drifts (colour bugs are silent, AGENTS trap 11).
+
+Everything else in pointwise (the other 129 cases) passes on Adreno.
 
 ## ctest summary on Adreno (task 0.3)
 
@@ -104,15 +127,18 @@ the encode/decode pair drifts (trap: colour bugs are silent).
 |---|---|---|
 | `spk_android_device_info` | ✅ | device facts above; `math_mode_ok:true` |
 | `spk_vulkan_smoke` | ✅ | FIR oracle, `iir_df_acc` 1.49e-8, headless session + render |
-| `spk_vulkan_pointwise` | ❌ | `cctf_decode` BT.709 breakpoint only (see R1b) |
+| `spk_vulkan_pointwise` | ❌ | `cctf_decode` BT.709 breakpoint only — the runtime-`pow` breakpoint is non-portable by 1 ULP across host runtimes and drivers (R1b, root-caused; fix deferred to stage 1) |
 | `spk_vulkan_grain` | ✅ | Philox exact, Poisson/lognormal distributions in tolerance |
 | `spk_vulkan_resample` | ✅ | mirror bilinear, max err 3.15e-7 |
 | `spk_vulkan_transfer` | ✅ | ranges, dependencies, lifetimes |
 | `spk_vulkan_geometry` | ✅ | 192 cases, df resample 4.999e-7 |
 | `spk_vulkan_lut_di` | ✅ | 96 cases, max err 6.97e-7 |
 
-**7 of 8 green.** The one red is the single `pow`-precision sample, not a
-kernel class.
+## ctest summary on Adreno (task 0.3)
+
+**7 of 8 probes green** on the Adreno 740 with the fma fix in place; the one
+red is the recorded, root-caused BT.709 breakpoint (R1b) — a single sample in
+one mode of one kernel, not a kernel class.
 
 ## What stage 0 did *not* run (and why)
 
