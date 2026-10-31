@@ -97,7 +97,9 @@ if(NOT APPLE)
         set_target_properties(spk_volk PROPERTIES POSITION_INDEPENDENT_CODE ON LINKER_LANGUAGE C)
         target_include_directories(spk_volk PUBLIC
             "${CMAKE_CURRENT_SOURCE_DIR}/third_party/volk" "${SPEKTRALAB_VULKAN_HEADERS}")
-        if(NOT WIN32)
+        # Android's libvulkan.so lives at the system path; NDK clang finds
+        # dlopen without an explicit -ldl, so only desktop POSIX needs DL_LIBS.
+        if(NOT WIN32 AND NOT ANDROID)
             target_link_libraries(spk_volk PUBLIC ${CMAKE_DL_LIBS})
         endif()
 
@@ -148,6 +150,9 @@ if(NOT APPLE)
         if(NOT WIN32)
             find_package(Threads REQUIRED)
             target_link_libraries(spektralab_engine PUBLIC Threads::Threads)
+        endif()
+        if(ANDROID)
+            target_link_libraries(spektralab_engine PUBLIC android log)
         endif()
         add_dependencies(spektralab_engine spektralab_vulkan_resources)
 
@@ -254,6 +259,19 @@ if(NOT APPLE)
                 add_test(NAME spk_vulkan_${probe}
                     COMMAND spk_vulkan_${probe} "${vulkan_resource_dir}")
             endforeach()
+
+            if(ANDROID)
+                # Stage-0 device probe (issue #2 task 0.3): records deviceName,
+                # maxStorageBufferRange, the memory-type table and the math-mode
+                # guard on the real Adreno device. Lives in android/, not tests/,
+                # because it is a porting instrument rather than a ctest gate.
+                add_executable(spk_android_device_info "${CMAKE_CURRENT_SOURCE_DIR}/../android/android_device_info.cpp")
+                target_include_directories(spk_android_device_info PRIVATE
+                    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+                target_link_libraries(spk_android_device_info PRIVATE spektralab_engine)
+                add_dependencies(spk_android_device_info spektralab_vulkan_resources)
+            endif()
 
             if(SPEKTRALAB_BUILD_TEST_DLL)
                 add_executable(spk_windows_feature_boundaries tests/windows_feature_boundaries.cpp)
